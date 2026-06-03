@@ -1,3 +1,471 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>VibeDrop — 全平台跨裝置快傳</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            vibe: { 400: '#818cf8', 500: '#6366f1', 600: '#4f46e5' },
+          },
+        },
+      },
+    };
+  </script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <style>
+    body {
+      background: linear-gradient(145deg, #07070f 0%, #0f0f1f 35%, #12122a 70%, #0a1628 100%);
+      min-height: 100dvh;
+    }
+    .glass {
+      background: rgba(255, 255, 255, 0.04);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .gradient-text {
+      background: linear-gradient(90deg, #a5b4fc, #818cf8, #c084fc);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .glow-ring {
+      box-shadow: 0 0 40px rgba(99, 102, 241, 0.15), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    }
+    @keyframes pulse-soft {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.65; }
+    }
+    .animate-pulse-soft { animation: pulse-soft 2s ease-in-out infinite; }
+  </style>
+</head>
+<body class="text-slate-100 antialiased">
+  <div id="root"></div>
+
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+
+  // ─── 常數設定 ───────────────────────────────────────────────
+  const MD_BREAKPOINT = 768;           // RWD：Tailwind md 斷點（px）
+  const CHUNK_SIZE = 32 * 1024;        // 切片大小 32KB（介於 16KB～64KB 建議範圍）
+  const MAX_BUFFERED = 256 * 1024;     // DataChannel 緩衝上限，超過則節流等待
+  const LARGE_FILE_WARN = 100 * 1024 * 1024; // 100MB 記憶體警告門檻
+
+
+  // ─── 工具函式 ─────────────────────────────────────────────────
+
+
+  /** 隨機產生 5 位數純數字 Peer ID（10000～99999） */
+  function generateShortPeerId() {
+    return String(Math.floor(10000 + Math.random() * 90000));
+  }
+
+
+  /** 偵測是否為 iOS / iPadOS Safari（需手動下載按鈕） */
+  function isIOSDevice() {
+    return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  }
+
+
+  /**
+   * 正規化房間名稱（PeerJS Peer ID）。
+   * 允許 3～32 字：小寫英數、底線、連字號；例如 asus123。
+   */
+  function normalizeRoomName(name) {
+    const s = String(name).trim().toLowerCase();
+    if (!/^[a-z0-9][a-z0-9_-]{2,31}$/.test(s)) return null;
+    return s;
+  }
+
+
+  /**
+   * 正規化安全密鑰（Secure Token）。
+   * 房主與訪客必須輸入完全相同的一串密碼，才能通過握手驗證。
+   */
+  function normalizeRoomToken(token) {
+    const s = String(token).trim();
+    if (s.length < 4 || s.length > 64) return null;
+    return s;
+  }
+
+
+  /** 握手驗證用的 DataChannel 訊息類型（與檔案傳輸訊息分開處理） */
+  const AUTH_MSG = {
+    TOKEN: 'auth-token',     // 訪客連線後第一個封包：送出本機 Token
+    SUCCESS: 'auth-success', // 房主驗證通過後回傳
+    FAIL: 'auth-fail',       // 房主驗證失敗（可選，主要仍會 conn.close）
+  };
+
+
+  /** PeerJS 連線設定（含 Google STUN） */
+  function peerJsOptions() {
+    return {
+      config: {
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+      },
+      debug: 0,
+    };
+  }
+
+
+  /**
+   * 將 chunk 索引與二進位資料打包成單一 ArrayBuffer 傳送。
+   * PeerJS 對「包在 JSON 物件裡的 ArrayBuffer」無法正確序列化，必須送裸二進位。
+   * 格式：[4 bytes uint32 大端 index][chunk bytes...]
+   */
+  function packChunkMessage(index, chunkBuffer) {
+    const payload = new Uint8Array(4 + chunkBuffer.byteLength);
+    new DataView(payload.buffer).setUint32(0, index, false);
+    payload.set(new Uint8Array(chunkBuffer), 4);
+    return payload.buffer;
+  }
+
+
+  function unpackChunkMessage(buffer) {
+    const view = new DataView(buffer);
+    const index = view.getUint32(0, false);
+    const data = buffer.slice(4);
+    return { index, data };
+  }
+
+
+  /** 等待 DataChannel bufferedAmount 低於門檻，避免 buffer 爆掉 */
+  function waitForBuffer(conn, maxBuffered = MAX_BUFFERED) {
+    return new Promise((resolve) => {
+      const tick = () => {
+        const amount = conn.bufferedAmount ?? 0;
+        if (amount < maxBuffered) resolve();
+        else setTimeout(tick, 40);
+      };
+      tick();
+    });
+  }
+
+
+  /** 格式化位元組為可讀字串 */
+  function formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
+  }
+
+
+  // ─── 自訂 Hook：RWD 視窗寬度與觸控偵測 ─────────────────────
+
+
+  function useViewport() {
+    const [width, setWidth] = useState(() => window.innerWidth);
+    const [hasTouch, setHasTouch] = useState(false);
+
+
+    useEffect(() => {
+      const onResize = () => setWidth(window.innerWidth);
+      window.addEventListener('resize', onResize);
+      setHasTouch(
+        'ontouchstart' in window ||
+        navigator.maxTouchPoints > 0 ||
+        window.matchMedia('(pointer: coarse)').matches
+      );
+      return () => window.removeEventListener('resize', onResize);
+    }, []);
+
+
+    // 寬度 >= 768：大螢幕左右雙欄；否則手機縱向流
+    const isDesktop = width >= MD_BREAKPOINT;
+    // 手機端 RWD：以 768px 斷點判定，啟用三鍵選檔 UI
+    const isMobile = width < MD_BREAKPOINT;
+
+
+    return { width, hasTouch, isDesktop, isMobile };
+  }
+
+
+  // ─── 主應用 ─────────────────────────────────────────────────
+
+
+  function App() {
+    const { isDesktop, isMobile } = useViewport();
+
+
+    const [myPeerId, setMyPeerId] = useState(null);
+    const [peerStatus, setPeerStatus] = useState('idle'); // idle | initializing | ready | error
+    const [connStatus, setConnStatus] = useState('idle'); // idle | connecting | authenticating | connected
+    const [roomRole, setRoomRole] = useState(null); // null | 'host' | 'guest'
+    const [activeRoom, setActiveRoom] = useState(null);
+    const [roomNameInput, setRoomNameInput] = useState('');
+    const [roomTokenInput, setRoomTokenInput] = useState('');
+    const [roomError, setRoomError] = useState('');
+    const [unauthorizedAlert, setUnauthorizedAlert] = useState(false);
+    const [isSecureLink, setIsSecureLink] = useState(false);
+    const [statusMsg, setStatusMsg] = useState('輸入房間名稱與安全密鑰，建立或加入房間');
+    const [largeFileWarn, setLargeFileWarn] = useState(false);
+    const [currentFileName, setCurrentFileName] = useState('');
+
+
+    // 傳輸狀態（雙方進度同步）
+    const [transfer, setTransfer] = useState({
+      active: false,
+      role: null,       // 'send' | 'receive'
+      fileName: '',
+      fileSize: 0,
+      localBytes: 0,    // 本機已送/已收
+      remoteBytes: 0,   // 對方回報的 bytes（同步用）
+      percent: 0,
+      phase: '',        // sending | receiving | done
+    });
+
+
+    const [receivedBlob, setReceivedBlob] = useState(null);
+    const [receivedFileName, setReceivedFileName] = useState('');
+    const [saveUrl, setSaveUrl] = useState(null);
+
+
+    const peerRef = useRef(null);
+    const connRef = useRef(null);
+    const receiveStateRef = useRef(null);
+    const sendAbortRef = useRef(false);
+    const desktopFileInputRef = useRef(null);
+    const cameraInputRef = useRef(null);
+    const galleryInputRef = useRef(null);
+    const filesInputRef = useRef(null);
+    const roleRef = useRef(null);
+    const activeRoomRef = useRef(null);
+    const roomTokenRef = useRef(null);
+    /** 是否已完成 Token 握手；未完成前禁止檔案傳輸 */
+    const connAuthenticatedRef = useRef(false);
+
+
+    // ─── 進度計算：本機 + 對方回報取較高值，雙方 UI 一致 ─────
+    const updateTransferProgress = useCallback((patch) => {
+      setTransfer((prev) => {
+        const next = { ...prev, ...patch };
+        const local = next.localBytes ?? prev.localBytes;
+        const remote = next.remoteBytes ?? prev.remoteBytes;
+        const synced = Math.max(local, remote);
+        const size = next.fileSize || prev.fileSize || 1;
+        next.percent = Math.min(100, Math.round((synced / size) * 100));
+        return next;
+      });
+    }, []);
+
+
+    // ─── 透過 DataChannel 廣播進度給對端 ─────────────────────
+    const sendProgressSync = useCallback((conn, bytes, fileSize, direction) => {
+      if (!conn?.open) return;
+      try {
+        conn.send({
+          type: 'progress-sync',
+          bytes,
+          fileSize,
+          direction,
+        });
+      } catch (_) { /* 連線中斷時忽略 */ }
+    }, []);
+
+
+    // ─── 處理傳入的 DataChannel 訊息 ─────────────────────────
+    const handleData = useCallback((data) => {
+      // 【安全防線】未完成 Token 握手前，拒絕處理任何檔案或進度封包
+      if (!connAuthenticatedRef.current) return;
+
+
+      // 裸 ArrayBuffer / Uint8Array = 檔案切片（見 packChunkMessage）
+      const isBinary =
+        data instanceof ArrayBuffer ||
+        (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(data));
+      if (isBinary) {
+        const raw =
+          data instanceof ArrayBuffer
+            ? data
+            : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+        const { index, data: chunkBuf } = unpackChunkMessage(raw);
+        const state = receiveStateRef.current;
+        if (!state) return;
+        const byteLen = chunkBuf.byteLength;
+        state.chunks.set(index, chunkBuf);
+        state.receivedBytes += byteLen;
+        updateTransferProgress({
+          localBytes: state.receivedBytes,
+          fileSize: state.fileSize,
+        });
+        if (connRef.current?.open) {
+          sendProgressSync(
+            connRef.current,
+            state.receivedBytes,
+            state.fileSize,
+            'receive'
+          );
+        }
+        return;
+      }
+
+
+      if (!data || typeof data !== 'object' || !data.type) return;
+
+
+      switch (data.type) {
+        case 'progress-sync': {
+          // 接收對方進度回報，更新 remoteBytes 使雙方進度條同步
+          updateTransferProgress({
+            remoteBytes: data.bytes,
+            fileSize: data.fileSize || undefined,
+          });
+          break;
+        }
+
+
+        case 'file-meta': {
+          receiveStateRef.current = {
+            fileName: data.fileName,
+            fileSize: data.fileSize,
+            fileType: data.fileType,
+            totalChunks: data.totalChunks,
+            chunkSize: data.chunkSize,
+            chunks: new Map(),
+            receivedBytes: 0,
+          };
+          setTransfer({
+            active: true,
+            role: 'receive',
+            fileName: data.fileName,
+            fileSize: data.fileSize,
+            localBytes: 0,
+            remoteBytes: 0,
+            percent: 0,
+            phase: 'receiving',
+          });
+          setReceivedBlob(null);
+          setSaveUrl(null);
+          setStatusMsg(`正在接收：${data.fileName}`);
+          break;
+        }
+
+
+        case 'file-complete': {
+          const state = receiveStateRef.current;
+          if (!state) return;
+          const ordered = [];
+          for (let i = 0; i < state.totalChunks; i++) {
+            ordered.push(state.chunks.get(i));
+          }
+          const blob = new Blob(ordered, { type: state.fileType || 'application/octet-stream' });
+          const url = URL.createObjectURL(blob);
+          setReceivedBlob(blob);
+          setReceivedFileName(state.fileName);
+          setSaveUrl(url);
+          updateTransferProgress({ localBytes: state.fileSize, percent: 100, phase: 'done' });
+          setStatusMsg(`接收完成：${state.fileName}`);
+          receiveStateRef.current = null;
+
+
+          // 嘗試自動下載（非 iOS 較可靠）
+          tryAutoDownload(url, state.fileName);
+          break;
+        }
+
+
+        default:
+          break;
+      }
+    }, [updateTransferProgress, sendProgressSync]);
+
+
+    /**
+     * 【安全性核心】Token 握手驗證（Authentication Handshake）
+     *
+     * 流程說明：
+     * 1. 訪客（手機端）DataChannel 一開啟，立刻送出 auth-token 封包。
+     * 2. 房主（電腦端）收到連線後先進入 authenticating，比對 Token 是否與本機設定一致。
+     * 3. Token 正確 → 回傳 auth-success，雙方標記 connAuthenticatedRef，開放傳輸。
+     * 4. Token 錯誤 → 房主立刻 conn.close()，畫面顯示非法連線警告。
+     */
+    const completeSecureHandshake = useCallback((conn) => {
+      connAuthenticatedRef.current = true;
+      setConnStatus('connected');
+      setIsSecureLink(true);
+      setUnauthorizedAlert(false);
+      const room = activeRoomRef.current;
+      setStatusMsg(
+        room
+          ? `房間「${room}」安全連線已建立（對端 ${conn.peer}）`
+          : `P2P 安全連線已建立（對端 ${conn.peer}）`
+      );
+    }, []);
+
+
+    /**
+     * 【安全防禦】房主拒絕非法連線：主動斷線並提示使用者
+     */
+    const rejectUnauthorizedConnection = useCallback((conn) => {
+      // 嚴格比對失敗時，必須立刻切斷該 Peer 連線，避免第三人竊聽或送假封包
+      try {
+        conn.close();
+      } catch (_) {
+        /* 連線可能已關閉，忽略 */
+      }
+      if (connRef.current === conn) {
+        connRef.current = null;
+      }
+      connAuthenticatedRef.current = false;
+      setIsSecureLink(false);
+      setConnStatus('idle');
+      setUnauthorizedAlert(true);
+      const room = activeRoomRef.current;
+      setStatusMsg(
+        room
+          ? `房間「${room}」：已阻擋未授權連線`
+          : '已阻擋未授權連線'
+      );
+    }, []);
+
+
+    const attachConnection = useCallback((conn) => {
+      connRef.current = conn;
+      connAuthenticatedRef.current = false;
+      setIsSecureLink(false);
+
+
+      conn.on('open', () => {
+        setConnStatus('authenticating');
+        const role = roleRef.current;
+
+
+        if (role === 'guest') {
+          // 【訪客端】連線建立的瞬間，自動送出驗證封包（內含使用者輸入的 Token）
+          const token = roomTokenRef.current;
+          setStatusMsg('正在送出安全密鑰進行驗證…');
+          try {
+            conn.send({ type: AUTH_MSG.TOKEN, token });
+          } catch (_) {
+            setStatusMsg('無法送出驗證封包，請重新加入房間');
+            setConnStatus('idle');
+          }
+          return;
+        }
+
+
+        if (role === 'host') {
+          // 【房主端】通道已開，但尚未驗證 — 暫不開放傳輸，等待對方 auth-token
+          setStatusMsg('偵測到連線，等待對方安全密鑰驗證…');
+        }
+      });
+
+
+      conn.on('data', (raw) => {
+        const role = roleRef.current;
 
 
         // ── 房主：驗證訪客送來的 Token ──────────────────────────
@@ -7,3 +475,789 @@
             rejectUnauthorizedConnection(conn);
             return;
           }
+
+
+          const expectedToken = roomTokenRef.current;
+          const incomingToken = String(raw.token ?? '');
+
+
+          // 【關鍵比對】必須與建立房間時設定的 Token「完全一致」（含大小寫）
+          if (incomingToken === expectedToken && expectedToken) {
+            try {
+              conn.send({ type: AUTH_MSG.SUCCESS });
+            } catch (_) {
+              rejectUnauthorizedConnection(conn);
+              return;
+            }
+            completeSecureHandshake(conn);
+            return;
+          }
+
+
+          // Token 錯誤：立刻斷線，杜絕竊聽與惡意干擾
+          rejectUnauthorizedConnection(conn);
+          return;
+        }
+
+
+        // ── 訪客：等待房主 auth-success ─────────────────────────
+        if (role === 'guest' && !connAuthenticatedRef.current) {
+          if (raw && typeof raw === 'object' && raw.type === AUTH_MSG.SUCCESS) {
+            completeSecureHandshake(conn);
+            return;
+          }
+          if (raw && typeof raw === 'object' && raw.type === AUTH_MSG.FAIL) {
+            setStatusMsg('安全密鑰驗證失敗，請確認 Token 是否與房主相同');
+            try {
+              conn.close();
+            } catch (_) {}
+            setConnStatus('idle');
+            return;
+          }
+          return;
+        }
+
+
+        // 握手完成後，才進入一般檔案傳輸處理
+        handleData(raw);
+      });
+
+
+      conn.on('close', () => {
+        if (connRef.current === conn) {
+          const wasAuthenticated = connAuthenticatedRef.current;
+          connRef.current = null;
+          connAuthenticatedRef.current = false;
+          setIsSecureLink(false);
+          setConnStatus('idle');
+          if (roleRef.current === 'host') {
+            const room = activeRoomRef.current;
+            setStatusMsg(room ? `房間「${room}」仍開啟，等待他人加入…` : '連線已關閉，等待他人加入…');
+          } else if (!wasAuthenticated) {
+            setStatusMsg('連線已關閉：安全密鑰可能錯誤或房主已離線');
+          } else {
+            setStatusMsg('連線已關閉');
+          }
+        }
+      });
+
+
+      conn.on('error', () => {
+        connAuthenticatedRef.current = false;
+        setIsSecureLink(false);
+        setConnStatus('idle');
+        setStatusMsg('無法連線至房間，請確認房間名稱、安全密鑰與房主是否已在線');
+      });
+    }, [handleData, completeSecureHandshake, rejectUnauthorizedConnection]);
+
+
+    /** 銷毀目前 Peer 實例並重置連線狀態 */
+    const destroyPeer = useCallback(() => {
+      sendAbortRef.current = true;
+      if (peerRef.current) {
+        peerRef.current.destroy();
+        peerRef.current = null;
+      }
+      connRef.current = null;
+      connAuthenticatedRef.current = false;
+      roomTokenRef.current = null;
+      setMyPeerId(null);
+      setConnStatus('idle');
+      setIsSecureLink(false);
+      setUnauthorizedAlert(false);
+    }, []);
+
+
+    useEffect(() => {
+      roleRef.current = roomRole;
+    }, [roomRole]);
+
+
+    useEffect(() => {
+      activeRoomRef.current = activeRoom;
+    }, [activeRoom]);
+
+
+    useEffect(() => {
+      roomTokenRef.current = normalizeRoomToken(roomTokenInput);
+    }, [roomTokenInput]);
+
+
+    useEffect(() => {
+      return () => {
+        sendAbortRef.current = true;
+        peerRef.current?.destroy();
+      };
+    }, []);
+
+
+    /**
+     * 建立房間：以 roomName 作為 PeerJS Peer ID（房主節點）。
+     * 若 ID 已被佔用 → 顯示「房間已存在，請換一個名稱」。
+     */
+    const createRoom = useCallback(() => {
+      const room = normalizeRoomName(roomNameInput);
+      if (!room) {
+        setRoomError('房間名稱需 3～32 字，僅限小寫英數、底線、連字號');
+        return;
+      }
+      const token = normalizeRoomToken(roomTokenInput);
+      if (!token) {
+        setRoomError('安全密鑰需 4～64 字，請自訂一串僅房主與訪客知道的密碼');
+        return;
+      }
+
+
+      setRoomError('');
+      setUnauthorizedAlert(false);
+      destroyPeer();
+      roomTokenRef.current = token;
+      sendAbortRef.current = false;
+      setRoomRole('host');
+      setActiveRoom(room);
+      setPeerStatus('initializing');
+      setStatusMsg(`正在建立房間「${room}」…`);
+
+
+      const peer = new Peer(room, peerJsOptions());
+      peerRef.current = peer;
+
+
+      peer.on('open', (id) => {
+        setMyPeerId(id);
+        setPeerStatus('ready');
+        setStatusMsg(`房間「${room}」已建立，請告訴對方「房間名稱 + 相同安全密鑰」`);
+      });
+
+
+      peer.on('connection', (conn) => {
+        setConnStatus('connecting');
+        attachConnection(conn);
+      });
+
+
+      peer.on('error', (err) => {
+        const taken =
+          err.type === 'unavailable-id' ||
+          err.type === 'unavailable-id ' ||
+          (err.message && /taken|unavailable/i.test(err.message));
+        if (taken) {
+          setRoomError('房間已存在，請換一個名稱');
+          setPeerStatus('idle');
+          setRoomRole(null);
+          setActiveRoom(null);
+          destroyPeer();
+          setStatusMsg('建立失敗：名稱已被使用');
+          return;
+        }
+        setPeerStatus('error');
+        setStatusMsg(`Peer 錯誤：${err.message || err.type}`);
+      });
+    }, [roomNameInput, roomTokenInput, destroyPeer, attachConnection]);
+
+
+    /**
+     * 加入房間：本機使用隨機 5 位數 Peer ID，再 peer.connect(roomName) 連向房主。
+     */
+    const joinRoom = useCallback(
+      (attempt = 0) => {
+        const room = normalizeRoomName(roomNameInput);
+        if (!room) {
+          setRoomError('房間名稱需 3～32 字，僅限小寫英數、底線、連字號');
+          return;
+        }
+        const token = normalizeRoomToken(roomTokenInput);
+        if (!token) {
+          setRoomError('安全密鑰需 4～64 字，必須與房主設定的 Token 完全相同');
+          return;
+        }
+        if (attempt > 12) {
+          setRoomError('無法取得本機節點 ID，請稍後再試');
+          return;
+        }
+
+
+        setRoomError('');
+        setUnauthorizedAlert(false);
+        destroyPeer();
+        roomTokenRef.current = token;
+        sendAbortRef.current = false;
+        setRoomRole('guest');
+        setActiveRoom(room);
+        setPeerStatus('initializing');
+        setConnStatus('connecting');
+
+
+        const guestId = generateShortPeerId();
+        setStatusMsg(`正在加入房間「${room}」…`);
+
+
+        const peer = new Peer(guestId, peerJsOptions());
+        peerRef.current = peer;
+
+
+        peer.on('open', () => {
+          setMyPeerId(guestId);
+          setPeerStatus('ready');
+          const conn = peer.connect(room, { reliable: true });
+          if (!conn) {
+            setConnStatus('idle');
+            setStatusMsg('無法發起連線，請稍後再試');
+            return;
+          }
+          attachConnection(conn);
+        });
+
+
+        peer.on('connection', (conn) => {
+          attachConnection(conn);
+        });
+
+
+        peer.on('error', (err) => {
+          const idTaken =
+            err.type === 'unavailable-id' ||
+            (err.message && /taken|unavailable/i.test(err.message));
+          if (idTaken) {
+            joinRoom(attempt + 1);
+            return;
+          }
+          setPeerStatus('error');
+          setConnStatus('idle');
+          setStatusMsg(`加入失敗：${err.message || err.type}`);
+        });
+      },
+      [roomNameInput, roomTokenInput, destroyPeer, attachConnection]
+    );
+
+
+    /** 離開房間並回到初始狀態 */
+    const leaveRoom = useCallback(() => {
+      destroyPeer();
+      setRoomRole(null);
+      setActiveRoom(null);
+      setPeerStatus('idle');
+      setRoomError('');
+      sendAbortRef.current = false;
+      setUnauthorizedAlert(false);
+      setStatusMsg('已離開房間，可建立或加入新房間');
+    }, [destroyPeer]);
+
+
+    // ─── iOS Safari：自動下載常失敗，仍嘗試一次 ───────────────
+    function tryAutoDownload(url, name) {
+      if (isIOSDevice()) return;
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    }
+
+
+    function manualSave() {
+      if (!saveUrl || !receivedFileName) return;
+      const a = document.createElement('a');
+      a.href = saveUrl;
+      a.download = receivedFileName;
+      a.click();
+    }
+
+
+    // ─── Chunk-based 傳送：metadata → slice → 節流 → 進度同步 ─
+    async function sendFile(file) {
+      const conn = connRef.current;
+      if (!conn?.open || !connAuthenticatedRef.current) {
+        setStatusMsg('請先完成安全密鑰驗證並建立 P2P 連線');
+        return;
+      }
+
+
+      sendAbortRef.current = false;
+      const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+
+      setTransfer({
+        active: true,
+        role: 'send',
+        fileName: file.name,
+        fileSize: file.size,
+        localBytes: 0,
+        remoteBytes: 0,
+        percent: 0,
+        phase: 'sending',
+      });
+      setStatusMsg(`正在傳送：${file.name}`);
+
+
+      // 1. 先送 metadata
+      conn.send({
+        type: 'file-meta',
+        fileName: file.name,
+        fileSize: file.size,
+        fileType: file.type,
+        totalChunks,
+        chunkSize: CHUNK_SIZE,
+      });
+
+
+      let offset = 0;
+      let index = 0;
+
+
+      // 2. 使用 file.slice() 分段，不一次讀入整檔
+      while (offset < file.size && !sendAbortRef.current) {
+        await waitForBuffer(conn);
+
+
+        const end = Math.min(offset + CHUNK_SIZE, file.size);
+        const slice = file.slice(offset, end);
+        const buffer = await slice.arrayBuffer();
+
+
+        // 裸二進位切片（非 JSON 包裝）
+        conn.send(packChunkMessage(index, buffer));
+
+
+        offset += buffer.byteLength;
+        index += 1;
+
+
+        // 3. 本機進度 + 同步給接收方
+        updateTransferProgress({ localBytes: offset, fileSize: file.size });
+        sendProgressSync(conn, offset, file.size, 'send');
+      }
+
+
+      if (!sendAbortRef.current) {
+        conn.send({ type: 'file-complete' });
+        updateTransferProgress({ localBytes: file.size, percent: 100, phase: 'done' });
+        setStatusMsg(`傳送完成：${file.name}`);
+      }
+    }
+
+
+    /**
+     * 統一選檔入口：寫入 currentFileName 後進入 sendFile 傳輸流程。
+     * 各 input 的 onChange 獨立，但共用此邏輯。
+     */
+    function commitSelectedFile(file) {
+      if (!file) return;
+      setCurrentFileName(file.name);
+      if (file.size > LARGE_FILE_WARN) {
+        setLargeFileWarn(true);
+      } else {
+        setLargeFileWarn(false);
+      }
+      setStatusMsg(`已選取「${file.name}」，準備傳送…`);
+      sendFile(file);
+    }
+
+
+    /** 清除 input value，避免 iOS Safari 重複選同一檔案不觸發 onChange */
+    function clearInputValue(e) {
+      e.target.value = null;
+    }
+
+
+    function onCameraFileSelected(e) {
+      const file = e.target.files?.[0];
+      clearInputValue(e);
+      commitSelectedFile(file);
+    }
+
+
+    function onGalleryFileSelected(e) {
+      const file = e.target.files?.[0];
+      clearInputValue(e);
+      commitSelectedFile(file);
+    }
+
+
+    function onFilesFileSelected(e) {
+      const file = e.target.files?.[0];
+      clearInputValue(e);
+      commitSelectedFile(file);
+    }
+
+
+    function onDesktopFileSelected(e) {
+      const file = e.target.files?.[0];
+      clearInputValue(e);
+      commitSelectedFile(file);
+    }
+
+
+    const isConnected = connStatus === 'connected';
+    const showSaveButton = saveUrl && receivedFileName;
+
+
+    return (
+      <div className="min-h-dvh pb-8">
+        {/* 頂部標題 */}
+        <header className="px-4 pt-6 pb-4 max-w-6xl mx-auto">
+          <h1 className="text-2xl md:text-3xl font-bold gradient-text">VibeDrop</h1>
+          <p className="text-slate-400 text-sm mt-1">
+            房間名稱 + 安全密鑰 · WebRTC P2P 傳檔 · 檔案不經伺服器
+          </p>
+        </header>
+
+
+        {/* 大檔案記憶體警告 */}
+        {largeFileWarn && (
+          <div className="mx-4 max-w-6xl md:mx-auto mb-4 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-amber-200 text-sm">
+            ⚠️ 檔案超過 100MB，行動裝置瀏覽器可能會因記憶體限制而刷新，請保持網頁開啟。
+          </div>
+        )}
+
+
+        {/*
+          RWD 佈局：大螢幕左側房間配對、右側傳輸；手機縱向排列
+        */}
+        <main
+          className={`max-w-6xl mx-auto px-4 gap-6 ${
+            isDesktop ? 'grid grid-cols-2' : 'flex flex-col'
+          }`}
+        >
+          {/* 左欄：Room / Channel 房間配對 */}
+          <section className="space-y-4">
+            <div className="glass glow-ring rounded-2xl p-5">
+              <p className="text-xs text-slate-500 uppercase tracking-wider">房間名稱</p>
+              <input
+                type="text"
+                value={roomNameInput}
+                onChange={(e) => {
+                  setRoomNameInput(e.target.value);
+                  setRoomError('');
+                }}
+                placeholder="例如 asus123"
+                disabled={
+                  peerStatus === 'initializing' ||
+                  connStatus === 'connected' ||
+                  connStatus === 'authenticating'
+                }
+                className="mt-3 w-full rounded-xl bg-black/30 border border-white/10 px-4 py-3 font-mono text-xl tracking-wide focus:outline-none focus:ring-2 focus:ring-vibe-500 disabled:opacity-50"
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <p className="text-[11px] text-slate-500 mt-2">
+                3～32 字 · 小寫英數、底線、連字號
+              </p>
+            </div>
+
+
+            <div className="glass glow-ring rounded-2xl p-5">
+              <p className="text-xs text-slate-500 uppercase tracking-wider">安全密鑰 (Token)</p>
+              <input
+                type="password"
+                value={roomTokenInput}
+                onChange={(e) => {
+                  setRoomTokenInput(e.target.value);
+                  setRoomError('');
+                }}
+                placeholder="例如 MyClass2026!"
+                disabled={
+                  peerStatus === 'initializing' ||
+                  connStatus === 'connected' ||
+                  connStatus === 'authenticating'
+                }
+                className="mt-3 w-full rounded-xl bg-black/30 border border-emerald-500/20 px-4 py-3 font-mono text-lg tracking-wide focus:outline-none focus:ring-2 focus:ring-emerald-500/60 disabled:opacity-50"
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <p className="text-[11px] text-slate-500 mt-2">
+                4～64 字 · 僅房主與訪客知悉，防止他人猜測房間名後竊連
+              </p>
+            </div>
+
+
+            {roomError && (
+              <div className="rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-3 text-red-200 text-sm">
+                {roomError}
+              </div>
+            )}
+
+
+            {unauthorizedAlert && (
+              <div className="rounded-xl border border-red-500/50 bg-red-600/20 px-4 py-3 text-red-100 text-sm font-medium">
+                ❌ 偵測到未授權的非法連線嘗試！
+              </div>
+            )}
+
+
+            <div className="glass rounded-2xl p-4 flex flex-col gap-3">
+              <button
+                type="button"
+                onClick={createRoom}
+                disabled={
+                  peerStatus === 'initializing' ||
+                  connStatus === 'connected' ||
+                  connStatus === 'authenticating' ||
+                  peerStatus === 'ready'
+                }
+                className="w-full rounded-xl bg-vibe-600 hover:bg-vibe-500 disabled:opacity-40 py-3.5 font-semibold transition"
+              >
+                建立房間（成為房主）
+              </button>
+              <button
+                type="button"
+                onClick={() => joinRoom(0)}
+                disabled={
+                  peerStatus === 'initializing' ||
+                  connStatus === 'connected' ||
+                  connStatus === 'authenticating' ||
+                  peerStatus === 'ready'
+                }
+                className="w-full rounded-xl border border-vibe-500/50 bg-vibe-600/15 hover:bg-vibe-600/25 disabled:opacity-40 py-3.5 font-semibold transition"
+              >
+                加入房間
+              </button>
+              {(peerStatus === 'ready' || peerStatus === 'error') && (
+                <button
+                  type="button"
+                  onClick={leaveRoom}
+                  className="w-full rounded-xl border border-white/10 text-slate-400 hover:text-slate-200 py-2 text-sm transition"
+                >
+                  離開房間
+                </button>
+              )}
+            </div>
+
+
+            {activeRoom && peerStatus === 'ready' && (
+              <div className="glass glow-ring rounded-2xl p-5">
+                <p className="text-xs text-slate-500 uppercase tracking-wider">
+                  {roomRole === 'host' ? '目前房間（房主）' : '已加入房間'}
+                </p>
+                <p className="text-4xl font-mono font-bold gradient-text mt-2 break-all">
+                  {activeRoom}
+                </p>
+                {roomRole === 'host' && (
+                  <p className="text-sm text-slate-400 mt-3">
+                    請讓對方輸入<strong className="text-slate-300">相同房間名稱與安全密鑰</strong>後點「加入房間」
+                  </p>
+                )}
+                {roomRole === 'guest' && myPeerId && (
+                  <p className="text-xs text-slate-500 mt-3 font-mono">
+                    本機節點 ID：{myPeerId}
+                  </p>
+                )}
+              </div>
+            )}
+          </section>
+
+
+          {/* 右欄：連線狀態 + 傳輸 */}
+          <section className="space-y-4">
+            <div className="glass glow-ring rounded-2xl p-5">
+              <div className="flex items-center gap-2">
+                <span
+                  className={`w-2.5 h-2.5 rounded-full ${
+                    isConnected ? 'bg-emerald-400 shadow-[0_0_8px_#34d399]' : 'bg-slate-600'
+                  }`}
+                />
+                <span className="text-sm font-medium">
+                  {connStatus === 'connected'
+                    ? 'P2P 已連線'
+                    : connStatus === 'authenticating'
+                    ? '安全驗證中…'
+                    : connStatus === 'connecting'
+                    ? '連線中…'
+                    : '尚未連線'}
+                </span>
+              </div>
+              <p className="text-slate-400 text-sm mt-2">{statusMsg}</p>
+
+
+              {isSecureLink && connStatus === 'connected' && (
+                <div className="mt-4 flex items-center gap-3 rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-4 py-3">
+                  <span className="text-2xl" aria-hidden>🔒</span>
+                  <p className="text-sm font-medium text-emerald-300">
+                    加密點對點安全連線已建立
+                  </p>
+                </div>
+              )}
+            </div>
+
+
+            {/* 傳輸進度條（雙方即時同步） */}
+            {transfer.active && (
+              <div className="glass rounded-2xl p-5">
+                <div className="flex justify-between text-sm mb-2">
+                  <span className="text-slate-300 truncate max-w-[60%]">
+                    {transfer.role === 'send' ? '傳送中' : '接收中'}：{transfer.fileName}
+                  </span>
+                  <span className="font-mono text-vibe-400">{transfer.percent}%</span>
+                </div>
+                <div className="h-2.5 rounded-full bg-black/40 overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-vibe-600 to-purple-500 transition-all duration-150"
+                    style={{ width: `${transfer.percent}%` }}
+                  />
+                </div>
+                <p className="text-xs text-slate-500 mt-2">
+                  {formatBytes(Math.max(transfer.localBytes, transfer.remoteBytes))}
+                  {' / '}
+                  {formatBytes(transfer.fileSize)}
+                </p>
+              </div>
+            )}
+
+
+            {/* iOS Safari：明顯的儲存檔案按鈕 */}
+            {showSaveButton && (
+              <div className="glass rounded-2xl p-5 border border-emerald-500/30">
+                <p className="text-sm text-emerald-300 mb-3">
+                  {isIOSDevice()
+                    ? 'iPhone / iPad 請點下方按鈕儲存檔案'
+                    : '檔案已就緒，亦可再次下載'}
+                </p>
+                <button
+                  type="button"
+                  onClick={manualSave}
+                  className="w-full rounded-xl bg-emerald-600 hover:bg-emerald-500 py-4 text-lg font-semibold transition shadow-lg shadow-emerald-900/30"
+                >
+                  儲存檔案 · {receivedFileName}
+                </button>
+              </div>
+            )}
+
+
+            {/* 檔案選取：手機三鍵獨立 input vs 桌面單一 input */}
+            <div className="glass rounded-2xl p-5">
+              {isMobile ? (
+                <>
+                  {/* 手機端：三個隱藏 input，各自 ref + onChange，共用 commitSelectedFile */}
+                  <input
+                    ref={cameraInputRef}
+                    type="file"
+                    className="hidden"
+                    accept="image/*"
+                    capture="environment"
+                    onChange={onCameraFileSelected}
+                    disabled={!isConnected}
+                  />
+                  <input
+                    ref={galleryInputRef}
+                    type="file"
+                    className="hidden"
+                    accept="image/*"
+                    onChange={onGalleryFileSelected}
+                    disabled={!isConnected}
+                  />
+                  <input
+                    ref={filesInputRef}
+                    type="file"
+                    className="hidden"
+                    accept="*/*"
+                    onChange={onFilesFileSelected}
+                    disabled={!isConnected}
+                  />
+
+
+                  <div className="flex flex-col gap-3">
+                    <button
+                      type="button"
+                      disabled={!isConnected}
+                      onClick={() => cameraInputRef.current?.click()}
+                      className="w-full min-h-[88px] rounded-2xl border-2 border-vibe-500/60 bg-vibe-600/15 hover:bg-vibe-600/25 disabled:opacity-40 flex items-center gap-4 px-5 transition active:scale-[0.98]"
+                    >
+                      <span className="text-3xl shrink-0" aria-hidden>📷</span>
+                      <div className="text-left">
+                        <span className="block text-lg font-semibold text-vibe-200">拍照掃描</span>
+                        <span className="block text-xs text-slate-500 mt-0.5">直接開啟後置相機</span>
+                      </div>
+                    </button>
+
+
+                    <button
+                      type="button"
+                      disabled={!isConnected}
+                      onClick={() => galleryInputRef.current?.click()}
+                      className="w-full min-h-[88px] rounded-2xl border-2 border-purple-500/40 bg-purple-600/10 hover:bg-purple-600/20 disabled:opacity-40 flex items-center gap-4 px-5 transition active:scale-[0.98]"
+                    >
+                      <span className="text-3xl shrink-0" aria-hidden>🖼️</span>
+                      <div className="text-left">
+                        <span className="block text-lg font-semibold text-purple-200">從相簿選擇</span>
+                        <span className="block text-xs text-slate-500 mt-0.5">照片圖庫 · 考卷圖片</span>
+                      </div>
+                    </button>
+
+
+                    <button
+                      type="button"
+                      disabled={!isConnected}
+                      onClick={() => filesInputRef.current?.click()}
+                      className="w-full min-h-[88px] rounded-2xl border-2 border-slate-500/40 bg-white/5 hover:bg-white/10 disabled:opacity-40 flex items-center gap-4 px-5 transition active:scale-[0.98]"
+                    >
+                      <span className="text-3xl shrink-0" aria-hidden>📁</span>
+                      <div className="text-left">
+                        <span className="block text-lg font-semibold text-slate-200">選擇檔案</span>
+                        <span className="block text-xs text-slate-500 mt-0.5">PDF、ZIP 或大型檔案</span>
+                      </div>
+                    </button>
+                  </div>
+
+
+                  {currentFileName && (
+                    <p className="text-center text-xs text-slate-400 mt-3 truncate">
+                      已選取：{currentFileName}
+                    </p>
+                  )}
+                </>
+              ) : (
+                <>
+                  <input
+                    ref={desktopFileInputRef}
+                    type="file"
+                    className="hidden"
+                    accept="image/*,.pdf,.doc,.docx,.zip,.mp4,.mov,*/*"
+                    onChange={onDesktopFileSelected}
+                    disabled={!isConnected}
+                  />
+                  <button
+                    type="button"
+                    disabled={!isConnected}
+                    onClick={() => desktopFileInputRef.current?.click()}
+                    className="w-full rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 disabled:opacity-40 py-4 px-4 transition"
+                  >
+                    選擇檔案並傳送
+                  </button>
+                  {currentFileName && (
+                    <p className="text-center text-xs text-slate-400 mt-2 truncate">
+                      已選取：{currentFileName}
+                    </p>
+                  )}
+                </>
+              )}
+
+
+              {!isConnected && (
+                <p className="text-center text-xs text-slate-500 mt-3">
+                  請先與另一台裝置建立連線
+                </p>
+              )}
+            </div>
+
+
+            <p className="text-[11px] text-slate-600 text-center leading-relaxed">
+              傳輸採 WebRTC DataChannel 點對點 · 切片 {CHUNK_SIZE / 1024}KB ·
+              Signaling 僅用 PeerJS Cloud
+            </p>
+          </section>
+        </main>
+      </div>
+    );
+  }
+
+
+  const root = ReactDOM.createRoot(document.getElementById('root'));
+  root.render(<App />);
+  </script>
+</body>
+</html>
+
+
+
